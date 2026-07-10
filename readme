@@ -1,0 +1,37 @@
+Ran terminal command: uv pip list 2>/dev/null || pip list 2>/dev/null
+
+你的開發環境已經安裝了以下主要 packages：
+
+**Web Framework**
+- `fastapi` 0.116.1 + `uvicorn` 0.35.0 + `gunicorn` 23.0.0
+- `starlette` 0.47.3
+
+**ORM / Database**
+- `sqlmodel` 0.0.24 + `sqlalchemy` 2.0.39
+- `pyodbc` 5.2.0（MSSQL 連線）
+- `alembic` 1.15.2（DB migration）
+
+**Data Validation**
+- `pydantic` 2.10.6
+
+**HTTP / Auth**
+- `httpx` 0.28.1、`requests` 2.32.5
+- `pyjwt` 2.10.1
+
+**Azure**
+- `azure-communication-email` 1.1.0（寄信）
+
+**Testing**
+- `pytest` 8.3.5 + `pytest-cov`、`pytest-mock`、`pytest-asyncio`
+- `faker` 37.4.2、`pyfakefs` 5.9.3
+- `coverage` 7.6.12、`responses` 0.25.8
+
+**Dev Tools**
+- `ruff` 0.14.11（linter/formatter）
+- `pre-commit` 4.3.0
+
+**其他**
+- `openpyxl` 3.1.5（Excel 處理）
+- `python-dotenv` 1.0.1
+
+總共約 70 個套件（含相依項），看起來開發環境的依賴都有正確安裝。
