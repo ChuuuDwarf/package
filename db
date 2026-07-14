@@ -1,338 +1,57 @@
-# PostgreSQL 溫備援 + 手動升主 Runbook(簡單版・教學)
-
-> 架構:兩台機器。pg1 是主庫,pg2 是熱備(隨時同步)兼備份機。
-> pg1 掛掉時,你**手動**把 pg2 升成主。沒有 etcd / Patroni / witness / HAProxy,單純很多。
-> 每一步照「**目的 → 動手 → 驗證 → 踩雷**」走。
-
----
-
-## 先搞懂在做什麼(30 秒)
-
-- **pg1(主)** 把每一筆變更(WAL)即時傳給 **pg2(備)**,pg2 隨時是一份熱的複本、可讀但不可寫。
-- **pgBackRest** 在 pg2 上存「時光機」——持續備份,可還原到任意時間點。這防的是 replication 救不了的狀況(例如誤刪整張表)。
-- **主掛掉時**:你確認 pg1 真的死了,在 pg2 上跑一個 `pg_promote()`,pg2 就變成主,再把 App 指過去。
-
-跟全自動版的差別只有一個:**「切」是你手動按,不是系統自動判斷**。少了自動判斷,就不需要那一整套投票機制,所以簡單非常多。
-
----
-
-## 節點規劃(填你的實際 IP)
-
-| 主機 | 角色 | IP |
-|------|------|-----|
-| pg1 | 主庫(Primary) | 10.0.0.11 |
-| pg2 | 熱備 + 備份(Standby) | 10.0.0.12 |
-
-下面指令的 IP 都用這組,自己換掉。密碼看到 `REPL_PASSWORD` 也換成你自己的。
-
----
-
-## 步驟 0 — 兩台的基本準備
-
-**目的**:裝好 PostgreSQL、開好 port,後面才連得起來。
-
-**動手**(pg1、pg2 都做):
-
-```bash
-# hosts
-cat <<'EOF' | sudo tee -a /etc/hosts
-10.0.0.11 pg1
-10.0.0.12 pg2
-EOF
-
-# 防火牆:兩台之間開 5432 + SSH(內網段換成你的)
-sudo ufw allow from 10.0.0.0/24 to any port 22
-sudo ufw allow from 10.0.0.0/24 to any port 5432
-sudo ufw enable
-
-# 裝 PostgreSQL 18(PGDG 官方源)
-sudo apt install -y curl ca-certificates
-sudo install -d /usr/share/postgresql-common/pgdg
-sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
-  https://www.postgresql.org/media/keys/ACCC4CF8.asc
-echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
-  https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-  | sudo tee /etc/apt/sources.list.d/pgdg.list
-sudo apt update
-sudo apt install -y postgresql-18 pgbackrest
-```
-
-裝完 PostgreSQL 會自動建好並啟動一個預設資料庫(這版我們就用它,不像全自動版要砍掉)。
-
-**驗證**:兩台都能 `sudo -u postgres psql -c "SELECT version();"` 看到 18.x。
-
-> 檔案位置(Debian/Ubuntu):設定在 `/etc/postgresql/18/main/`,資料在 `/var/lib/postgresql/18/main/`,用 `systemctl restart postgresql` 重啟。
-
----
-
-## 步驟 1 — 設定主庫 pg1
-
-**目的**:打開「允許被複製」的開關,並建一個給 pg2 用的複製帳號。
-
-**動手**:建一個設定 drop-in `/etc/postgresql/18/main/conf.d/replication.conf`:
-
-```ini
-listen_addresses = '*'
-wal_level = replica
-max_wal_senders = 10
-max_replication_slots = 10
-hot_standby = on
-
-# 備份用(步驟 3 會設 pgBackRest,先寫進來)
-archive_mode = on
-archive_command = 'pgbackrest --stanza=pg-main archive-push %p'
-```
-
-在 `/etc/postgresql/18/main/pg_hba.conf` 末尾加一行,放行 pg2 來做複製:
-
-```
-host    replication    replicator    10.0.0.12/32    scram-sha-256
-```
-
-建複製帳號並重啟:
-
-```bash
-sudo -u postgres psql -c "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'REPL_PASSWORD';"
-sudo systemctl restart postgresql
-```
-
-**驗證**:
-
-```bash
-sudo -u postgres psql -c "SHOW wal_level;"       # 應回 replica
-sudo -u postgres psql -c "SELECT rolname FROM pg_roles WHERE rolreplication;"  # 看到 replicator
-```
-
-**踩雷**:`archive_command` 現在會開始嘗試推 WAL,但 pgBackRest 還沒設好(步驟 3),所以會報 archive 失敗——**先不用理它**,等步驟 3 設好就會通。(只是別放著不管太久,WAL 會累積。)
-
----
-
-## 步驟 2 — 把 pg2 做成熱備
-
-**目的**:把 pg1 的資料整份拷到 pg2,並讓 pg2 進入「持續跟隨」模式。
-
-**原理**:`pg_basebackup` 會幫你把主庫整個複製過來,加上 `-R` 會自動寫好「去哪裡找主庫、用哪個帳號」的設定,加上 `-C -S` 會建一個複製槽(slot),確保主庫不會在備機還沒收到前就把 WAL 刪掉。
-
-**動手**(在 **pg2** 上):
-
-```bash
-# 停掉 pg2 預設的資料庫,清空資料目錄(裡面是空的預設庫,可以砍)
-sudo systemctl stop postgresql
-sudo -u postgres bash -c 'rm -rf /var/lib/postgresql/18/main/*'
-
-# 從 pg1 拉一份完整基底備份(會提示輸入密碼,或用下面的 PGPASSWORD)
-sudo -u postgres PGPASSWORD='REPL_PASSWORD' pg_basebackup \
-  -h 10.0.0.11 -U replicator \
-  -D /var/lib/postgresql/18/main \
-  -R -C -S pg2_slot -X stream -P
-
-# 啟動 pg2,它會自動連上 pg1 開始跟隨
-sudo systemctl start postgresql
-```
-
-**驗證**(這步是整套的核心,務必確認):
-
-```bash
-# 在 pg2:應回 t(true),代表它是備機
-sudo -u postgres psql -c "SELECT pg_is_in_recovery();"
-
-# 在 pg1:應看到 pg2 的連線,state = streaming
-sudo -u postgres psql -c "SELECT client_addr, state, sync_state FROM pg_stat_replication;"
-```
-
-**真的在同步嗎?實測一下**:
-
-```bash
-# pg1:建一張表塞資料
-sudo -u postgres psql -c "CREATE TABLE t_test(id int); INSERT INTO t_test VALUES (1);"
-# pg2:馬上查得到就對了
-sudo -u postgres psql -c "SELECT * FROM t_test;"
-```
-
-pg2 查得到那筆 `1`,恭喜,複製通了。
-
-**踩雷**:
-- `pg_basebackup` 連不上 → pg1 的 `pg_hba.conf` 沒放行 `.12`,或 `listen_addresses` 沒設 `'*'`,或防火牆擋 5432。
-- 密碼錯 → `replicator` 的密碼跟你打的 `PGPASSWORD` 不一致。
-- pg2 試圖寫入會報錯(`cannot execute ... in a read-only transaction)——**這是正常的**,備機本來就唯讀。
-
----
-
-## 步驟 3 — pgBackRest 備份(repo 在 pg2)
-
-**目的**:建時光機。replication 防機器掛,備份防資料被誤刪/損毀,兩者都要。
-
-### 3.1 SSH 互信(pg1 ↔ pg2 的 postgres 使用者,雙向)
-
-**為什麼雙向**:pg1 當主時把 WAL 推到 pg2;pg2 跑備份時要連回主庫讀資料。兩邊都要能免密碼 SSH。
-
-```bash
-# 在 pg1:產鑰,印出公鑰
-sudo -u postgres ssh-keygen -t ed25519 -N "" -f /var/lib/postgresql/.ssh/id_ed25519
-sudo -u postgres cat /var/lib/postgresql/.ssh/id_ed25519.pub
-
-# 在 pg2:把 pg1 的公鑰貼進去
-sudo -u postgres mkdir -p /var/lib/postgresql/.ssh
-echo "貼上 pg1 的公鑰" | sudo -u postgres tee -a /var/lib/postgresql/.ssh/authorized_keys
-sudo -u postgres chmod 700 /var/lib/postgresql/.ssh
-sudo -u postgres chmod 600 /var/lib/postgresql/.ssh/authorized_keys
-```
-
-反過來再做一次(pg2 產鑰、公鑰貼到 pg1)。**驗證**(兩個方向都不該問密碼):
-
-```bash
-sudo -u postgres ssh postgres@pg2 hostname   # 在 pg1 跑,回 pg2
-sudo -u postgres ssh postgres@pg1 hostname   # 在 pg2 跑,回 pg1
-```
-
-### 3.2 設定檔
-
-**pg2 = repo host + 本地備機**(`/etc/pgbackrest/pgbackrest.conf`):
-
-```ini
-[global]
-repo1-path=/var/lib/pgbackrest
-repo1-retention-full=2
-repo1-retention-diff=4
-process-max=2
-log-level-console=info
-start-fast=y
-
-[pg-main]
-pg1-host=10.0.0.11
-pg1-path=/var/lib/postgresql/18/main
-pg2-path=/var/lib/postgresql/18/main
-```
-
-**pg1 = 遠端主庫**(`/etc/pgbackrest/pgbackrest.conf`):
-
-```ini
-[global]
-repo1-host=10.0.0.12
-repo1-host-user=postgres
-log-level-console=info
-
-[pg-main]
-pg1-path=/var/lib/postgresql/18/main
-```
-
-### 3.3 初始化與首次備份(在 pg2 上跑)
-
-```bash
-sudo -u postgres pgbackrest --stanza=pg-main stanza-create
-sudo -u postgres pgbackrest --stanza=pg-main check      # 驗證 archive 通了
-sudo -u postgres pgbackrest --stanza=pg-main --type=full backup
-```
-
-**驗證**:`check` 回 `completed successfully`;之後 `sudo -u postgres pgbackrest info` 看得到一筆 full backup。這時回頭看步驟 1 的 archive 失敗也不再報錯了。
-
-### 3.4 排程(pg2 的 postgres crontab:`sudo -u postgres crontab -e`)
-
-```cron
-0 2 * * 0 pgbackrest --stanza=pg-main --type=full backup
-0 2 * * 1-6 pgbackrest --stanza=pg-main --type=diff backup
-```
-
----
-
-## 步驟 4 — App 怎麼連(平常)
-
-平常 App 直接連 pg1:`host=10.0.0.11 port=5432`。
-
-想讓「切換」時不用改 App 程式,兩個常見做法(挑一個,非必要):
-- **DNS 名稱**:讓 App 連 `db.internal`,平常指 pg1;切換時把它改指 pg2。
-- **浮動 IP**:給資料庫一個 VIP,平常綁 pg1;切換時手動把 VIP 搬到 pg2。
-
-最簡單就是先不用,切換時直接改 App 的連線字串。等你熟了再加上面任一個。
-
----
-
-## 步驟 5 — 主庫掛了,怎麼手動升主 ⭐
-
-**這是這套的重點操作,先在測試時演練幾次。**
-
-### 步驟
-
-1. **先確認 pg1 是真的死了**(不是只是網路不通)。這很重要——如果 pg1 其實還活著、你又把 pg2 升主,就會有兩個主同時收寫入,資料分岔。確認方法:能連上 pg1 的主機嗎?PostgreSQL 程序還在嗎?**確定連不上、救不回,才升 pg2。**
-
-2. **在 pg2 升主**:
-
-```bash
-sudo -u postgres psql -c "SELECT pg_promote();"
-# 或:sudo pg_ctlcluster 18 main promote
-```
-
-3. **驗證**:
-
-```bash
-sudo -u postgres psql -c "SELECT pg_is_in_recovery();"   # 現在應回 f,pg2 已是主、可寫
-```
-
-4. **把 App 指向 pg2**(改連線字串 / DNS / 搬 VIP)。
-
-到這裡服務就恢復了。
-
-### 事後:把修好的 pg1 變成新的備機
-
-pg1 修好後**不要直接當主開起來**(會變兩個主)。要讓它重新當 pg2 的備機。最簡單、最不會錯的方式是重做一次基底備份,只是主備角色對調:
-
-```bash
-# 在 pg1
-sudo systemctl stop postgresql
-sudo -u postgres bash -c 'rm -rf /var/lib/postgresql/18/main/*'
-sudo -u postgres PGPASSWORD='REPL_PASSWORD' pg_basebackup \
-  -h 10.0.0.12 -U replicator \
-  -D /var/lib/postgresql/18/main \
-  -R -C -S pg1_slot -X stream -P
-sudo systemctl start postgresql
-```
-
-(pg2 上也要先建好 `replicator` 帳號 + `pg_hba` 放行 pg1,做法同步驟 1。建議一開始兩台都把帳號和 hba 設好,以後切換就不用臨時補。)
-
-> 想少一步 rebuild、追得更快,可以研究 `pg_rewind`;但重做基底備份最直觀,先用這個。
-
----
-
-## 步驟 6 — PITR 還原演練(每季至少一次)
-
-```bash
-# 停 PostgreSQL、清空 data_dir 後,還原到指定時間
-sudo -u postgres pgbackrest --stanza=pg-main \
-  --type=time "--target=2026-01-15 14:30:00" --delta restore
-```
-
-**沒實際還原成功過的備份不算備份。**
-
----
-
-## Checklist
-
-- [ ] 步驟 2 的實測(pg1 建表 → pg2 查得到)有通
-- [ ] `pg_stat_replication` 在 pg1 看得到 pg2、state = streaming
-- [ ] pgBackRest `check` 通過、有第一筆 full backup
-- [ ] 升主流程**在測試環境演練過**至少一次
-- [ ] 兩台都建好 `replicator` 帳號 + `pg_hba` 放行對方(方便日後角色對調)
-- [ ] 升主前一定先確認舊主真的死了(防兩個主)
-- [ ] 監控磁碟用量(archive 失敗會塞爆 `pg_wal`)
-- [ ] 記得定期做 PITR 還原演練
-
----
-
-## 一頁拓樸
-
-```
-   App ── 連 pg1(切換時改指 pg2)
-           │
-          pg1  ──── streaming replication ────►  pg2
-        (主・可寫)                            (備・唯讀,兼 pgBackRest repo)
-                                                     │
-                                               時光機備份(可 PITR)
-
-   掛掉時:確認 pg1 真死 → 在 pg2 跑 pg_promote() → App 指向 pg2
-```
-
----
-
-## 之後想升級成全自動切?
-
-你現在做的**備份(pgBackRest)那一段完全不用改**。要升級只需要:再加一台迷你 witness、把兩台的複製改由 Patroni 託管、前面加 HAProxy。所以這版不是走回頭路,是打地基。
+import re
+import csv
+import os
+
+# ===== 依你實際的 log 格式修改這三個 pattern =====
+START_RE = re.compile(r"...starttime...")
+END_RE   = re.compile(r"...endtime...")
+ERROR_RE = re.compile(r"\bERROR\b", re.IGNORECASE)
+
+
+def parse_log(path):
+    """
+    檢查單一 log。
+    乾淨（有 start、有 end、start 之後沒 error）回傳 (start, end)，
+    有問題回傳 None。
+    """
+    start_time = None
+    end_time = None
+
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:                          # 逐行讀，6000 行也不吃記憶體
+            if start_time is None:
+                if START_RE.search(line):
+                    start_time = line.strip()
+                continue                        # start 之前都不管（含 error）
+            if ERROR_RE.search(line):
+                return None                     # 讀到 error 直接停、作廢
+            if END_RE.search(line):
+                end_time = line.strip()         # 持續更新，最後留下最後一個
+
+    if start_time is None or end_time is None:  # 缺 start 或缺 end → 作廢
+        return None
+    return (start_time, end_time)
+
+
+def process_logs(log_paths, output_csv):
+    """把乾淨的 log 寫進 CSV：檔名、開始時間、結束時間。"""
+    with open(output_csv, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["filename", "start_time", "end_time"])  # 表頭
+
+        for path in log_paths:
+            result = parse_log(path)
+            if result is None:
+                continue                        # 有問題 → 跳過
+            start_time, end_time = result
+            writer.writerow([os.path.basename(path), start_time, end_time])
+
+
+if __name__ == "__main__":
+    log_dir = "logs"                            # 依你的實際路徑改
+    logs = [
+        os.path.join(log_dir, f)
+        for f in os.listdir(log_dir)
+        if f.endswith(".log")
+    ]
+    process_logs(logs, "result.csv")
