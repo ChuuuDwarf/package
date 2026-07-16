@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""
+讀取一個資料夾裡的所有 CSV，為每個 CSV 畫一張 step runtime 甘特圖，
+最後再畫一張「所有 CSV 各 step 平均 runtime」的甘特圖。
+
+用法:
+    python gantt_notz.py <csv_dir> [-o <output_dir>]
+
+注意: 此版本直接把時間欄位丟給 pd.to_datetime，不處理 CST/UTC 等時區縮寫。
+      碰到這類字串會解析失敗並靜默 fallback 成 runtime 累加（gap 會消失）。
+      需要處理時區請用 gantt.py。
+"""
+
+import argparse
+import re
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# ---------- 欄位自動辨識 ----------
+# 只要標題裡「包含」這些關鍵字就會被抓到（大小寫、空白、底線都會先正規化）
+COLUMN_PATTERNS = {
+    "step":    [r"^step$", r"step"],
+    "start":   [r"^start", r"begin"],
+    "end":     [r"^end$", r"^end", r"finish", r"stop"],
+    "runtime": [r"runtime", r"elapsed", r"duration", r"cost"],
+    "name":    [r"file", r"^name$", r"case"],
+}
+
+
+def normalize(col: str) -> str:
+    return re.sub(r"[\s_\-()]+", "", str(col)).lower()
+
+
+def detect_columns(df: pd.DataFrame) -> dict:
+    """回傳 {邏輯欄位: 實際欄位名}"""
+    norm_map = {normalize(c): c for c in df.columns}
+    found = {}
+    for key, patterns in COLUMN_PATTERNS.items():
+        for pat in patterns:
+            hit = next((orig for n, orig in norm_map.items() if re.search(pat, n)), None)
+            if hit:
+                found[key] = hit
+                break
+    return found
+
+
+def load_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    cols = detect_columns(df)
+
+    missing = [k for k in ("step", "runtime") if k not in cols]
+    if missing:
+        raise ValueError(f"{path.name} 找不到欄位 {missing}，實際欄位為 {list(df.columns)}")
+
+    out = pd.DataFrame({
+        "step": pd.to_numeric(df[cols["step"]], errors="coerce"),
+        "runtime": pd.to_numeric(df[cols["runtime"]], errors="coerce"),
+    })
+
+    # start / end 有就用，用來排出真實時間軸；沒有就靠 runtime 累加
+    for k in ("start", "end"):
+        if k in cols:
+            out[k] = pd.to_datetime(df[cols[k]], errors="coerce")
+
+    out["label"] = df[cols["name"]] if "name" in cols else path.stem
+
+    out = out.dropna(subset=["step", "runtime"])
+    out["step"] = out["step"].astype(int)
+    return out.sort_values("step").reset_index(drop=True)
+
+
+# ---------- 畫圖 ----------
+def compute_offsets(df: pd.DataFrame) -> np.ndarray:
+    """每根 bar 的起點（秒）。有 start 欄就用相對時間，否則用 runtime 累加。"""
+    if "start" in df.columns and df["start"].notna().all():
+        t0 = df["start"].min()
+        return (df["start"] - t0).dt.total_seconds().to_numpy()
+    return np.concatenate([[0.0], np.cumsum(df["runtime"].to_numpy())[:-1]])
+
+
+def draw_gantt(steps, starts, durations, title, out_path, errors=None):
+    height = max(2.5, 0.45 * len(steps) + 1.5)
+    fig, ax = plt.subplots(figsize=(11, height))
+
+    ypos = np.arange(len(steps))
+    colors = plt.cm.viridis(np.linspace(0.15, 0.85, len(steps)))
+
+    ax.barh(ypos, durations, left=starts, height=0.55, color=colors,
+            edgecolor="white", xerr=errors,
+            error_kw=dict(ecolor="#444", capsize=3, lw=1))
+
+    span = max((starts + durations).max(), 1e-9)
+    for y, s, d in zip(ypos, starts, durations):
+        ax.text(s + d + span * 0.01, y, f"{d:.2f}s", va="center", fontsize=9)
+
+    ax.set_yticks(ypos)
+    ax.set_yticklabels([f"step {s}" for s in steps])
+    ax.invert_yaxis()
+    ax.set_xlabel("time (s)")
+    ax.set_title(title)
+    ax.set_xlim(0, span * 1.12)
+    ax.grid(axis="x", ls="--", alpha=0.4)
+    ax.set_axisbelow(True)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  -> {out_path}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("csv_dir", type=Path)
+    ap.add_argument("-o", "--output", type=Path, default=Path("gantt_output"))
+    args = ap.parse_args()
+
+    args.output.mkdir(parents=True, exist_ok=True)
+    files = sorted(args.csv_dir.glob("*.csv"))
+    if not files:
+        raise SystemExit(f"{args.csv_dir} 裡沒有 CSV")
+
+    all_rows = []
+    for f in files:
+        try:
+            df = load_csv(f)
+        except Exception as e:
+            print(f"[skip] {f.name}: {e}")
+            continue
+
+        print(f"[ok] {f.name} ({len(df)} steps)")
+        draw_gantt(
+            steps=df["step"].tolist(),
+            starts=compute_offsets(df),
+            durations=df["runtime"].to_numpy(),
+            title=f"{f.stem} — step runtime",
+            out_path=args.output / f"{f.stem}.png",
+        )
+        all_rows.append(df.assign(source=f.stem))
+
+    if not all_rows:
+        raise SystemExit("沒有任何 CSV 成功讀取")
+
+    # ---------- 平均圖 ----------
+    merged = pd.concat(all_rows, ignore_index=True)
+    stats = merged.groupby("step")["runtime"].agg(["mean", "std", "count"]).sort_index()
+    stats["std"] = stats["std"].fillna(0)
+
+    means = stats["mean"].to_numpy()
+    avg_starts = np.concatenate([[0.0], np.cumsum(means)[:-1]])
+
+    draw_gantt(
+        steps=stats.index.tolist(),
+        starts=avg_starts,
+        durations=means,
+        errors=stats["std"].to_numpy(),
+        title=f"Average step runtime across {len(all_rows)} CSVs",
+        out_path=args.output / "_average.png",
+    )
+
+    stats.to_csv(args.output / "_average.csv")
+    print("\n各 step 平均 runtime:")
+    print(stats.round(3).to_string())
+
+
+if __name__ == "__main__":
+    main()
