@@ -1,0 +1,292 @@
+---
+name: lsf-submission-strategy
+description: 依據工作特徵判斷 IBM LSF 該用哪種提交方式 — 單一 bsub、job array、chunk job、Session Scheduler、parallel job (blaunch/MPI) 或 dependency chain，並產出對應的 bsub 指令與注意事項。Use this skill whenever the user describes a batch workload, HPC job, or compute task and is deciding how to submit it — including mentions of LSF, bsub, bjobs, bacct, job array, session scheduler, ssched, chunk job, blaunch, LSB_ 環境變數, 或任何 "我有 N 個任務要跑" / "這樣提交會不會太慢" / "要不要拆成 array" 類型的問題。Also trigger when the user asks about dispatch overhead, scheduler load, queue tuning, pend time, 或為什麼很多短 job 跑很慢。**觸發門檻要低**：只要對話中出現 job、task、step、批次、叢集、排程、提交、跑很久、跑不完 這類詞彙，就算使用者只是隨口問「有沒有更好的方式」「這樣對嗎」「能不能更快」「幫我看一下」，也應該使用本 skill。若對話稍早已在討論使用者的 job 或 flow，之後任何含糊的優化詢問都預設觸發。即使使用者完全沒提到 LSF，只要情境是叢集批次運算就適用 — 寧可多觸發也不要漏掉。
+---
+
+# LSF 提交策略判斷
+
+決定一批工作要用哪種 LSF 提交方式。核心問題永遠是同一個：
+**每個 task 要不要各自走一次完整的排程/派送流程？**
+
+## 為什麼這個問題是核心
+
+LSF 中每個獨立的 job 都要付出固定成本：進入 mbatchd 的 job 表、被 mbschd 納入排程週期評估、
+派送到 sbatchd、啟動執行環境、回寫 lsb.acct。這個 per-job 成本記為 `t_dispatch`，
+在多數站台是**秒的等級**（0.5–5 秒，視叢集負載與排程週期而定）。
+
+所有提交方式的差異，本質上都是「這個成本付幾次、由誰付」。
+
+判斷時**不要看 job 的數量**。數量本身不決定任何事 — job array 跑五萬個元素是完全正常的。
+真正的判準是比值 `t_task / t_dispatch`。
+
+## 判斷流程
+
+依序檢查，第一個命中的就是答案。順序有意義，不要跳著看。
+
+### 第 1 關：task 之間需要同時執行並互相通訊嗎？
+
+如果需要（MPI、共享記憶體、需要彼此的中間結果），這不是「多個 task」，
+而是**一個平行 job**。用 `bsub -n` 配 blaunch 或 MPI wrapper。
+
+array 和 session 在這裡都是錯的答案 — 它們都不保證元素同時被派送。
+
+```bash
+bsub -n 64 -R "span[ptile=16]" mpirun ./solver
+```
+
+### 第 2 關：task 之間有相依關係嗎？
+
+有的話，先把相依結構畫出來，再對**每一層**分別套用本流程。
+層與層之間用 `-w` 串接。
+
+```bash
+bsub -J "stage1[1-100]" ./run.sh
+bsub -w "done(stage1)" -J "stage2[1-50]" ./run.sh
+```
+
+注意 `done(stage1)` 是整個 array 的 barrier。若只需要逐元素相依，
+用 `-w "done(stage1[$LSB_JOBINDEX])"` 才能讓兩層重疊執行 —
+這通常是縮短總時間最有效的一招，值得主動提出來。
+
+### 第 3 關：獨立 task，看 `t_task / t_dispatch`
+
+假設 `t_dispatch ≈ 1–3 秒`（不確定時用實測：連續送 20 個 sleep 0 的 job 量時間）。
+
+| `t_task` | 建議 | 理由 |
+|---|---|---|
+| > 10 分鐘 | **job array** | overhead 佔比 < 0.5%，完全可忽略 |
+| 1–10 分鐘 | **job array** | overhead 佔比數個百分點，仍可接受 |
+| 10–60 秒 | **chunk job**（次選 array） | overhead 開始明顯，chunk 是最省事的解法 |
+| 1–10 秒 | **Session Scheduler** | overhead 與工作本身同量級，array 不可行 |
+| < 1 秒 | **先重構**，再談提交方式 | 見下方「重構優先」 |
+
+`N < 10` 且彼此無關時，直接個別 `bsub` 就好，不需要任何機制。
+
+**RUNLIMIT (`-W`) 屬於這一關，不是正交軸。**
+`-W` 就是使用者宣告 `t_task` 的地方，也就是本關主判準本身。它還有兩個下游效果：
+
+- chunk job 通常要求 job 有明確且短的 RUNLIMIT 或 CPULIMIT，沒設就不會被 chunk。
+  「10–60 秒用 chunk」這個結論的前提是使用者有設 `-W`
+- backfill 需要 RUNLIMIT。沒設 `-W` 的 job 無法被塞進 reservation 的空隙，等待時間會明顯變長
+
+所以看到使用者沒設 `-W` 時要主動提出來，不管最後選哪種提交方式。
+估不準時給偏大的值：設太小會被 LSF 直接 kill，設太大只是少一點 backfill 機會，代價不對稱。
+
+### 第 4 關：套用推翻條件
+
+上面得到的答案，遇到下列情況要修正：
+
+**需要 per-task 顆粒度 → 往 array 靠**
+
+若使用者需要以下任一項，Session Scheduler 就不適用，即使 task 很短：
+- 用 `bjobs` 個別追蹤 task 狀態
+- 每個 task 不同的資源需求（記憶體、slot 數）
+- 每個 task 獨立的失敗重試（`-r`）或 exit code 處理
+- per-task 的 fairshare 計費或 preemption
+- SLA 的 velocity / throughput 目標計數（見「資源權利與 QoS」一節）
+
+Session 底下這些全部是「整個 session 一份」，拆不開。
+病根都相同：**session 破壞所有以 job 為單位的會計**。看到任何「per-job 統計」需求就要警覺。
+
+**單一 task 失敗會拖垮全體 → 往 array 靠**
+
+Session 內所有 task 共用同一個 job 的資源配額。一個 task 吃爆 MEMLIMIT，
+整個 session job 被 kill，其他還在執行的 task 一起陪葬。Array 則是一個元素死一個。
+
+這是**可靠性**問題，比「每個 task 資源需求不同」的彈性問題更嚴重。
+task 的記憶體用量不可預測、或曾經發生過 OOM 時，這一條足以單獨否決 session。
+
+**runtime 變異大 → session 的尾端損失會吃掉收益**
+
+Session 佔住固定 slot 直到最後一個 task 結束。若 task 長度分佈長尾，
+尾端會有大量 idle slot。變異係數大（例如最長是中位數的 10 倍以上）時，
+要嘛改用 array，要嘛在 session 內做動態分配並把長 task 先排。
+
+**受 licence 限制 → 兩者都救不了**
+
+若真正的瓶頸是 EDA licence 而非 slot，換提交方式完全無效。
+應該處理的是 `-R "rusage[lic=1:duration=...]"` 與 licence 排程，
+把使用者的注意力導回真正的瓶頸。
+
+**會影響到其他人 → 這是站台層級的考量**
+
+一次丟數萬個短 job 進去，拖慢的是整個叢集的 mbatchd/mbschd，
+不只是使用者自己的 turnaround。很多站台會限制提交速率或 array 大小。
+若使用者要送的量級很大，主動提醒這點並建議先問管理員。
+
+## 資源權利與 QoS（正交軸）
+
+Guaranteed Resource Pool、SLA、advance reservation 這一類機制回答的是
+「我有權拿到多少資源、什麼時候拿得到」，與「task 怎麼打包」是**兩條獨立的軸**。
+它們可以任意組合，不要把它們當成 array / session 的替代選項。
+
+判斷提交方式時**不需要**先知道有沒有 guarantee。先照前面的流程得出結論，
+再檢查下面的交互作用是否需要調整。
+
+### Guaranteed Resource Pool
+
+在 `lsb.resources` 定義，保障某群 consumer（queue / project / user / service class）
+拿得到的最小資源量，型態可以是 slot、host、package（slot + 記憶體）或 licence。
+使用者端透過 service class 取用（`bsub -sla <name>`），用 `bsla` 查看狀態。
+Guarantee 是**下限不是上限** — 資源有空時仍可超用。
+
+與提交方式的交互作用有兩個方向，要一起講清楚：
+
+**強化 session 的理由**：session 必須等 N 個 slot 湊齊才能啟動，
+N 大時這段等待可能吃掉全部收益。有 guarantee 等於這 N 個 slot 有下限保障，
+啟動時間從賭運氣變成可規劃。**這是 guarantee 對提交策略最重要的影響**，
+原本因為啟動不確定而被否決的 session 方案，在 guarantee 下可以重新評估。
+
+**弱化 session 的理由**：閒置的 guaranteed 資源可以借給其他 workload（loan policy 控制）。
+用 array 時 task 之間的空檔會回到 pool 被借走；用 session 時 slot 被一個 running job 佔著，
+LSF 看起來永遠是忙的。因此 **session 的尾端 idle 在 guarantee 環境下是純浪費** —
+自己用不到，別人也借不走。task 長度變異大時這項損失要明確算給使用者看。
+
+### SLA 目標類型
+
+velocity（同時執行的 job 數）與 throughput（單位時間完成的 job 數）目標
+都是**以 job 為單位計數**。裝了一萬個 task 的 session 在 SLA 眼中是 1 個 job，
+達成率會完全失真。有這兩類目標時，session 要嘛不用，要嘛接受 SLA 數字失去意義。
+
+deadline 目標看的是完成時間，不受此影響。
+
+### 資源分配上限（Limit）
+
+`lsb.resources` 的 Limit section 定義 SLOTS / JOBS / MEM / LICENSE 等資源的**上限**，
+可綁 USERS、QUEUES、HOSTS、PROJECTS。超過上限的 job 保持 pending。
+
+Limit 與 guarantee 是同一條軸的兩端 — guarantee 是下限，limit 是上限，
+兩者都不影響「task 怎麼打包」的結論，只影響該結論的可行性。
+
+與提交方式的交互作用取決於**上限的計數單位**，這個區分很關鍵：
+
+| Limit 型態 | Array | Session |
+|---|---|---|
+| `JOBS`（同時 job 數） | 受限，最多該數量的元素同時執行 | 一個 session 只計為 1 個 job |
+| `SLOTS` / `MEM` | 受限 | 同樣受限（`-n N` 是明著申請的） |
+
+也就是 **session 會繞過 JOBS 類上限，但繞不過 SLOTS 類**。
+成因與 fairshare、SLA velocity 完全相同：session 破壞 per-job 會計。
+
+這一點要謹慎處理。若站台是用 JOBS limit 在控管使用者間的公平性，
+改用 session 等於繞過管理員刻意設定的政策。技術可行不等於應該這樣做 —
+遇到這種情況，說明機制並建議先與管理員確認，不要當成規避額度的技巧來推薦。
+
+Array 的 `%M` 節流是同一件事的自願版本，也是主動待在額度內的正規做法。
+
+### Advance reservation
+
+`brsvadd` 預約特定時段的特定主機。與 guarantee 類似，
+主要效果是讓 session 的啟動時機變成確定的，適合需要在指定時間完成的批次。
+
+## 各方式的實作要點
+
+### job array
+
+```bash
+bsub -J "myjob[1-1000]%50" -o log/%I.out ./run.sh
+```
+
+- `%50` 限制同時執行數，對保護共享資源（licence、NFS、資料庫）很重要
+- task 內用 `$LSB_JOBINDEX` 取得自己的編號
+- 索引可跳號：`[1-100:2]`、`[1,5,9-20]`
+- 重跑失敗元素用 `brequeue -e <jobid>`，不必整批重送
+
+### chunk job
+
+由 queue 設定 `CHUNK_JOB_SIZE = N` 啟用，LSF 會自動把符合條件的短 job
+打包成一批派送，只付一次派送成本。
+
+這是最省事的選項 — 使用者的提交方式完全不用改。但有兩個前提：
+- 需要管理員在 queue 上設定，使用者自己改不了
+- 只對資源需求相同的 job 生效，且被 chunk 的 job 無法被 preempt / 無法 checkpoint
+
+看到 10–60 秒的 task 時，**先問 queue 有沒有開 chunk**，再考慮動手改成 session。
+
+### Session Scheduler
+
+```bash
+bsub -n 100 ssched --tasks task_file.txt
+```
+
+提交*一個*佔住 N 個 slot 的 job，由 session master 在已配置好的 slot 上
+直接發 task，繞過 mbatchd。派送延遲從秒降到毫秒。
+
+- task file 每行一個指令
+- 適合 task 數遠大於 slot 數（例如 10000 個 task 配 100 個 slot）
+- session 本身要排隊等 N 個 slot 湊齊，N 太大時等待時間可能吃掉收益。
+  這是 session 最常見的失敗原因 — 若使用者有 guaranteed pool，先確認 N 是否落在保障額度內
+
+### 重構優先（task < 1 秒）
+
+task 短到一秒以下時，任何提交機制的 overhead 都會佔主導。
+正確做法是**改變工作的粒度**，而不是找更快的提交方式：
+
+- 在 wrapper script 內用迴圈一次處理 100–1000 個工作單位
+- 把資料先合併，讓每個 task 拿到更大的輸入
+- 目標是讓每個 task 落回 1–10 分鐘的甜蜜區
+
+這一步的效益通常遠大於在 array 和 session 之間糾結。
+
+## 回答格式
+
+給出建議時，包含這四項：
+
+1. **結論**：用哪一種，一句話
+2. **依據**：命中了流程的哪一關、`t_task/t_dispatch` 大約多少
+3. **指令**：可直接使用的 `bsub` 範例，帶入使用者的實際數字
+4. **代價**：這個選擇放棄了什麼（顆粒度、彈性、需要管理員配合等）
+
+第 4 項不要省略。每個選擇都有代價，只講好處會讓使用者在踩到限制時才發現。
+
+資訊不足以判斷時，**優先問單一 task 的執行時間** — 這一個數字決定了大部分的分支。
+其次問是否需要 per-task 追蹤。其他資訊多半可以先給預設假設並標註出來。
+
+## 使用者只是隨口問「有沒有更好的方式」時
+
+這是最常見的進入方式，使用者通常不會主動提供結構化資料，也不該要求他們提供。
+**不要開口就要 CSV 或完整 job 清單**，那會讓對話直接卡住。
+
+改成用口語問這三個數字，能回答幾個就先算幾個：
+
+1. 每個 task 大概跑多久？（最重要，決定第 3 關）
+2. 大概幾個？（只用來估總量，不影響結論）
+3. 現在是怎麼送的？（才知道要跟什麼比較）
+
+拿到 1 就可以給出初步結論了。使用者說「大概幾分鐘」「不到一分鐘」這種模糊描述完全夠用，
+直接取區間中位數往下判斷，並把假設標註出來。
+
+若使用者手邊有 LSF，可以順帶提一句這些指令能拿到實測數字，
+但要講清楚是**選配**，沒有也能繼續：
+
+```bash
+bacct -l -u $USER              # 歷史紀錄，含實際 run time 與 pend time
+bjobs -a -o "jobid stat run_time pend_time max_mem"
+```
+
+**pend time 特別值得問一句。** 若時間主要花在排隊而非執行，
+換提交方式完全無效，問題在資源額度或政策。這一點要先確認，否則後面的建議都是白工。
+
+## 擴充這份規則
+
+新增判斷特徵時，先確認它屬於哪一類：
+
+- **主判準**（會改變結論的）→ 放進「判斷流程」，並想清楚它該插在第幾關
+- **修正條件**（不改主結論，但要加註或微調）→ 放進第 4 關的推翻條件
+- **實作細節**（不影響選擇，只影響怎麼寫）→ 放進「各方式的實作要點」
+- **正交軸**（回答的是不同問題，可與任何結論組合）→ 自成一節，
+  並明確寫出它與主流程的交互作用，方向相反的要兩邊都寫
+
+判斷順序是這份規則的價值所在。新特徵插錯位置會讓結論不穩定，
+所以加東西時要一併說明為什麼放在那個位置。
+
+第四類最容易被誤放。判斷方法：問「不知道這個特徵，能不能得出提交方式的結論？」
+如果能，它就是正交軸，不該進主流程。guarantee 是典型例子 —
+不知道有沒有 guarantee 也能決定要用 array 還是 session，
+它只是會調整這個結論的可行性與代價。
+
+**一個名詞不一定只屬於一類。** 「limit」就是例子，拆開後散落三處：
+RUNLIMIT 進主流程（它就是 `t_task` 的宣告方式）、
+allocation limit 進正交軸（與 guarantee 同軸反向）、
+MEMLIMIT 進推翻條件（爆炸半徑）。
+遇到涵蓋範圍大的名詞時，先拆成具體機制再逐一歸類，不要整包塞進同一節。
